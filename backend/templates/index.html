@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoDash AI</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #4A90E2;
+            text-align: center;
+        }
+        .upload-section {
+            border: 2px dashed #4A90E2;
+            padding: 30px;
+            text-align: center;
+            margin: 20px 0;
+            border-radius: 8px;
+        }
+        button {
+            background-color: #4A90E2;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #357ABD;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>AutoDash AI - Data Analysis Platform</h1>
+        
+        <div class="upload-section">
+            <h2>Upload Your Dataset</h2>
+            <input type="file" id="fileInput" accept=".csv,.xlsx,.xls">
+            <br><br>
+            <button onclick="uploadFile()">Analyze Dataset</button>
+        </div>
+
+        <div id="status" class="status" style="display: none;"></div>
+
+        <div id="results" style="display: none;">
+            <h2>Analysis Results</h2>
+            <div id="preview"></div>
+            <div id="insights"></div>
+        </div>
+    </div>
+
+    <script>
+        async function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const statusDiv = document.getElementById('status');
+            const resultsDiv = document.getElementById('results');
+            
+            if (!fileInput.files.length) {
+                showStatus('Please select a file first.', 'error');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+
+            try {
+                showStatus('Uploading and analyzing your dataset...', 'info');
+                
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    showStatus('File uploaded successfully!', 'success');
+                    displayResults(data);
+                } else {
+                    showStatus('Error: ' + data.detail, 'error');
+                }
+            } catch (error) {
+                showStatus('Error uploading file: ' + error.message, 'error');
+            }
+        }
+
+        function showStatus(message, type) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = message;
+            statusDiv.className = `status ${type}`;
+            statusDiv.style.display = 'block';
+        }
+
+        function displayResults(data) {
+            const resultsDiv = document.getElementById('results');
+            const previewDiv = document.getElementById('preview');
+            const insightsDiv = document.getElementById('insights');
+            
+            // Display basic info
+            previewDiv.innerHTML = `
+                <h3>Dataset Information</h3>
+                <p><strong>Filename:</strong> ${data.filename}</p>
+                <p><strong>Rows:</strong> ${data.rows}</p>
+                <p><strong>Columns:</strong> ${data.columns}</p>
+                <p><strong>Dataset Type:</strong> ${data.dataset_type} (confidence: ${(data.confidence * 100).toFixed(1)}%)</p>
+                
+                <h3>Data Preview</h3>
+                <div style="overflow-x: auto;">
+                    <table border="1" style="border-collapse: collapse; width: 100%;">
+                        <thead>
+                            <tr>
+                                ${Object.keys(data.preview[0]).map(col => `<th>${col}</th>`).join('')}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.preview.map(row => `
+                                <tr>
+                                    ${Object.values(row).map(val => `<td>${val}</td>`).join('')}
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            
+            resultsDiv.style.display = 'block';
+            
+            // Get AI insights
+            getAIInsights(data);
+        }
+
+        async function getAIInsights(data) {
+            try {
+                showStatus('Getting AI insights...', 'info');
+                
+                const response = await fetch('/api/get_ai_insights', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        preview: data.preview,
+                        dataset_type: data.dataset_type
+                    })
+                });
+
+                const insightsData = await response.json();
+                
+                if (insightsData.status === 'success') {
+                    const insightsDiv = document.getElementById('insights');
+                    insightsDiv.innerHTML = `
+                        <h3>AI Insights</h3>
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; border-left: 4px solid #4A90E2;">
+                            ${formatInsights(insightsData.insights)}
+                        </div>
+                    `;
+                    showStatus('Analysis complete!', 'success');
+                }
+            } catch (error) {
+                showStatus('Error getting insights: ' + error.message, 'error');
+            }
+        }
+
+        function formatInsights(insights) {
+            // Convert markdown-like formatting to HTML
+            return insights
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                .replace(/\n/g, '<br>')
+                .replace(/- (.*?)(<br>|$)/g, '<li>$1</li>')
+                .replace(/<li>/g, '<ul><li>')
+                .replace(/<\/li>(?!.*<li>)/g, '</li></ul>');
+        }
+    </script>
+</body>
+</html>

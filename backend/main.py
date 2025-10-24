@@ -47,9 +47,27 @@ warnings.filterwarnings("ignore", category=FutureWarning, message="errors='ignor
 app = FastAPI(title="AutoDash AI Backend", version="2.1")
 
 # Add CORS middleware
+# Expand common localhost/127.0.0.1 dev origins and allow override via env
+cors_origins_env = os.getenv("CORS_ORIGINS", "")
+if cors_origins_env:
+    allowed_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+else:
+    allowed_origins = [
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:3004",
+        "http://localhost:5000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:3004",
+        "http://127.0.0.1:5000",
+        "http://127.0.0.1:5173",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3004", "http://localhost:5000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -182,6 +200,89 @@ def is_year_or_time_column(series):
         if series.str.match(r'^\+?[\d\s-]{10,15}$').all():
             return True
     return False
+
+
+def detect_datetime_columns(df: pd.DataFrame, min_parse_rate: float = 0.6) -> List[str]:
+    """Robustly detect datetime-like columns by sampling and requiring a parse success rate threshold.
+    Does not mutate df. Uses column name hints to relax threshold slightly.
+    """
+    date_cols: List[str] = []
+    for col in df.columns:
+        s = df[col]
+        # Already datetime
+        try:
+            if is_datetime64_any_dtype(s):
+                date_cols.append(col)
+                continue
+        except Exception:
+            pass
+
+        # Consider only object-like or integer-like string encodings
+        if s.dtype == "object" or str(s.dtype).startswith(("int", "float")):
+            non_null = s.dropna()
+            if non_null.empty:
+                continue
+            # Use up to 500 samples for speed
+            sample = non_null.astype(str).head(500)
+            # Relax threshold if column name hints datetime
+            name_hint = any(hint in col.lower() for hint in ["date", "time", "timestamp", "datetime"])
+            threshold = 0.5 if name_hint else min_parse_rate
+            try:
+                parsed = pd.to_datetime(sample, errors="coerce", infer_datetime_format=True)
+                rate = parsed.notna().mean()
+                if rate >= threshold and parsed.notna().sum() >= 5:
+                    date_cols.append(col)
+            except Exception:
+                continue
+    # Prioritize true 'date' name matches first
+    def _priority(c: str) -> int:
+        cl = c.lower()
+        if "timestamp" in cl or "datetime" in cl:
+            return 0
+        if "date" in cl:
+            return 1
+        if "time" in cl:
+            return 2
+        if "year" in cl or "month" in cl or "day" in cl:
+            return 3
+        return 4
+    return sorted(list(dict.fromkeys(date_cols)), key=_priority)
+
+
+def infer_categorical_columns(df: pd.DataFrame, max_unique_absolute: int = 50, max_unique_ratio: float = 0.05) -> List[str]:
+    """Infer categorical columns including object/categorical dtypes and low-cardinality numerics,
+    while excluding ID-like and time/year columns.
+    """
+    categorical_cols: List[str] = []
+    n_rows = max(len(df), 1)
+    id_like_patterns = ["id", "uuid", "guid", "ssn", "phone", "zipcode", "postal", "code"]
+
+    # Start with declared object/category types
+    obj_cats = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    categorical_cols.extend(obj_cats)
+
+    # Add low-cardinality numeric columns (but not year/time or id-like)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    for col in numeric_cols:
+        s = df[col]
+        if is_year_or_time_column(s):
+            continue
+        unique_count = s.nunique(dropna=True)
+        unique_ratio = unique_count / n_rows
+        # Skip obvious identifiers (unique per row)
+        if unique_count >= n_rows * 0.9:
+            continue
+        # Skip id-like names
+        if any(p in col.lower() for p in id_like_patterns):
+            continue
+        if unique_count <= max_unique_absolute or unique_ratio <= max_unique_ratio:
+            categorical_cols.append(col)
+
+    # Exclude detected datetime columns
+    date_cols = set(detect_datetime_columns(df))
+    categorical_cols = [c for c in categorical_cols if c not in date_cols]
+    # De-duplicate while preserving order
+    return list(dict.fromkeys(categorical_cols))
 
 def classify_dataset(df):
     """Classify the dataset type using the hybrid model"""
@@ -333,10 +434,62 @@ The insights should be professional, detailed, and actionable for business stake
     except Exception as e:
         return f"Error generating insights: {str(e)}"
 
-def chat_with_data(df, question):
+def _chat_fallback(df: pd.DataFrame, question: str) -> str:
+    """Heuristic, offline fallback for chatbot when LLM is unavailable."""
+    q = (question or "").lower()
+    lines: List[str] = []
+
+    # Basic overview
+    total_rows, total_cols = df.shape
+    lines.append(f"Dataset has {total_rows} rows and {total_cols} columns.")
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    date_cols = detect_datetime_columns(df)
+
+    if any(k in q for k in ["missing", "null", "na", "clean"]):
+        missing_summary = df.isna().sum().sort_values(ascending=False).head(10)
+        items = [f"{col}: {int(val)}" for col, val in missing_summary.items() if val > 0]
+        if items:
+            lines.append("Top columns with missing values: " + ", ".join(items) + ".")
+        else:
+            lines.append("No missing values detected in the preview sample.")
+
+    if any(k in q for k in ["correlation", "relationship", "associate"]):
+        if len(numeric_cols) > 1:
+            corr = df[numeric_cols].corr(numeric_only=True).abs()
+            # Get top pairs excluding self
+            corr_pairs = []
+            for i, c1 in enumerate(corr.columns):
+                for j, c2 in enumerate(corr.columns):
+                    if j <= i:
+                        continue
+                    corr_pairs.append(((c1, c2), corr.loc[c1, c2]))
+            top = sorted(corr_pairs, key=lambda x: x[1], reverse=True)[:5]
+            if top:
+                lines.append("Strongest correlations (abs): " + ", ".join([f"{a}~{b}={v:.2f}" for (a,b), v in top]) + ".")
+        else:
+            lines.append("Not enough numeric columns to compute correlations.")
+
+    if any(k in q for k in ["trend", "over time", "seasonal", "time series", "forecast"]):
+        if date_cols and numeric_cols:
+            lines.append(f"Time-aware analysis is possible using {date_cols[0]} vs {numeric_cols[0]}. Consider a line chart and seasonal decomposition.")
+        else:
+            lines.append("No clear datetime and numeric column pair detected for time series in the sample.")
+
+    if not lines or len(lines) == 1:  # Provide general hints
+        lines.append("Numeric columns: " + (", ".join(numeric_cols[:10]) or "none") + ".")
+        lines.append("Categorical columns: " + (", ".join(categorical_cols[:10]) or "none") + ".")
+        if date_cols:
+            lines.append("Datetime columns: " + ", ".join(date_cols[:5]) + ".")
+        lines.append("You can ask about distributions, correlations, trends, or segment comparisons.")
+    return "\n".join(lines)
+
+
+def chat_with_data(df, question, history: Optional[List[Dict[str, Any]]] = None):
     """Generate a response to a user question about the data"""
     if not client:
-        return "Error: Groq client not initialized. Please check your API key."
+        return _chat_fallback(df, question)
 
     # Safeguard: empty dataset
     if df.empty or df.shape[1] == 0:
@@ -369,6 +522,20 @@ def chat_with_data(df, question):
     {df.head(3).to_string()}
     """
 
+    # Include brief chat history for context (last 3 exchanges)
+    history_text = ""
+    try:
+        if history:
+            recent = history[-6:]
+            rendered = []
+            for msg in recent:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                rendered.append(f"{role}: {content}")
+            history_text = "\n\nRecent conversation:\n" + "\n".join(rendered)
+    except Exception:
+        history_text = ""
+
     prompt = f"""
 You are a helpful data analyst assistant. The user has uploaded a dataset and is asking questions about it.
 Your task is to answer their question based on the dataset summary below. If the question requires specific calculations
@@ -387,6 +554,7 @@ User Question:
 {question}
 
 Provide your response in clear, plain language. If appropriate, use bullet points for multiple items.
+{history_text}
 """
 
     try:
@@ -400,7 +568,8 @@ Provide your response in clear, plain language. If appropriate, use bullet point
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"Error generating chat response: {str(e)}"
+        # Fall back to heuristic answer
+        return _chat_fallback(df, question)
 
 def show_key_metrics(df):
     """Display key metrics about the dataset"""
@@ -485,23 +654,10 @@ def analyze_time_series(df, theme, date_col=None, num_col=None, period=30):
     """Analyze time series data with specific columns"""
     results = {}
     
-    # If no columns provided, return available options
+    # If no columns provided, return available options (robust detection)
     if not date_col or not num_col:
-        # Find datetime columns
-        date_cols = []
-        for col in df.columns:
-            if df[col].dtype == 'object':
-                try:
-                    df[col] = pd.to_datetime(df[col], errors='coerce')
-                    if is_datetime64_any_dtype(df[col]):
-                        date_cols.append(col)
-                except:
-                    continue
-            elif is_datetime64_any_dtype(df[col]):
-                date_cols.append(col)
-        
+        date_cols = detect_datetime_columns(df)
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        
         return {
             "date_cols": date_cols,
             "numeric_cols": numeric_cols,
@@ -510,7 +666,7 @@ def analyze_time_series(df, theme, date_col=None, num_col=None, period=30):
     
     try:
         # Convert date column to datetime
-        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce', infer_datetime_format=True)
         df = df.dropna(subset=[date_col, num_col])
         time_df = df.set_index(date_col).sort_index()
         
@@ -892,16 +1048,14 @@ async def upload_file(file: UploadFile = File(...)):
         
         # ... continuing from the previous backend code
 
-        # Convert date columns if detected
-        for col in df.columns:
-            if is_datetime64_any_dtype(df[col]):
-                df[col] = pd.to_datetime(df[col])
-            elif df[col].dtype == 'object':
-                try:
-                    # Try to convert to datetime
-                    df[col] = pd.to_datetime(df[col], errors='coerce')
-                except:
-                    pass
+        # Robust datetime detection and conversion (do not blindly coerce all objects)
+        detected_date_cols = detect_datetime_columns(df)
+        for col in detected_date_cols:
+            try:
+                df[col] = pd.to_datetime(df[col], errors='coerce', infer_datetime_format=True)
+            except Exception:
+                # Keep original if conversion fails
+                continue
         
         # Classify dataset
         dataset_type, confidence = classify_dataset(df)
@@ -909,6 +1063,11 @@ async def upload_file(file: UploadFile = File(...)):
         # Get sample data for preview (handle large datasets)
         preview_data = df.head(10).to_dict(orient="records")
         
+        # Improved type extraction
+        numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
+        categorical_columns = infer_categorical_columns(df)
+        date_columns = [col for col in df.columns if is_datetime64_any_dtype(df[col])]
+
         response = {
             "status": "success",
             "filename": file.filename,
@@ -918,9 +1077,9 @@ async def upload_file(file: UploadFile = File(...)):
             "confidence": confidence,
             "preview": preview_data,
             "columns_info": [{"name": col, "dtype": str(df[col].dtype)} for col in df.columns],
-            "numeric_columns": df.select_dtypes(include=[np.number]).columns.tolist(),
-            "categorical_columns": df.select_dtypes(include=['object', 'category']).columns.tolist(),
-            "date_columns": [col for col in df.columns if is_datetime64_any_dtype(df[col])]
+            "numeric_columns": numeric_columns,
+            "categorical_columns": categorical_columns,
+            "date_columns": date_columns
         }
         
         return response
@@ -1168,7 +1327,7 @@ async def chat_with_data_endpoint(request: ChatRequest):
     """Enhanced chat endpoint matching Streamlit functionality"""
     try:
         df = pd.DataFrame(request.preview)
-        response = chat_with_data(df, request.message)
+        response = chat_with_data(df, request.message, history=request.history)
         
         return {
             "status": "success", 
@@ -1191,13 +1350,25 @@ async def export_dashboard(request: ExportRequest):
                 request.insights, 
                 theme=request.theme
             )
+            filename = f"autodash_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
             return StreamingResponse(
                 pdf_buffer,
                 media_type="application/pdf",
-                headers={"Content-Disposition": f"attachment; filename=autodash_report.pdf"}
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
             )
         else:
-            return {"status": "error", "message": "Only PDF export is supported"}
+            # Allow CSV export of preview as a helpful option
+            if request.format == "csv":
+                csv_buf = StringIO()
+                df.to_csv(csv_buf, index=False)
+                csv_buf.seek(0)
+                filename = f"autodash_preview_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                return StreamingResponse(
+                    iter([csv_buf.getvalue().encode('utf-8')]),
+                    media_type="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"}
+                )
+            return {"status": "error", "message": "Supported formats: pdf, csv"}
             
     except Exception as e:
         return {"status": "error", "message": str(e)}

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import Plot from 'react-plotly.js';
 
-const BACKEND_URL = "http://127.0.0.1:8000";
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8000";
 
 // --- STYLES ---
 const AppStyles = `
@@ -1362,7 +1362,7 @@ const FileUploadedView = ({ setPage, file, setDataset, setFile }) => {
         formData.append('file', file);
 
         try {
-            const response = await fetch('http://localhost:8000/api/upload', {
+            const response = await fetch(`${BACKEND_URL}/api/upload`, {
                 method: 'POST',
                 body: formData,
             });
@@ -2151,21 +2151,33 @@ const OverviewTab = ({
                     </div>
                 ) : visualizations ? (
                     <div className="chart-grid">
-                        {/* Render available visualizations */}
+                        {/* Make heavy charts full width for readability */}
+                        {visualizations.correlation_matrix && (
+                            <div className="full-width-chart">
+                                {renderVisualization(visualizations.correlation_matrix, 'Correlation Matrix', 600)}
+                            </div>
+                        )}
+
+                        {visualizations.scatter_matrix && (
+                            <div className="full-width-chart">
+                                {renderVisualization(visualizations.scatter_matrix, 'Scatter Plot Matrix', 800)}
+                            </div>
+                        )}
+
+                        {/* Render distributions and categorical charts */}
                         {Object.entries(visualizations).map(([key, vizData]) => {
                             if (key.includes('histogram') || key.includes('boxplot') || key.includes('barchart')) {
                                 return (
                                     <div key={key}>
-                                        {renderVisualization(vizData, key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()))}
+                                        {renderVisualization(
+                                            vizData,
+                                            key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
+                                        )}
                                     </div>
                                 );
                             }
                             return null;
                         })}
-                        
-                        {visualizations.correlation_matrix && 
-                            renderVisualization(visualizations.correlation_matrix, 'Correlation Matrix')
-                        }
                     </div>
                 ) : (
                     <div className="chart-error">
@@ -2669,7 +2681,7 @@ const AIBotAssistant = ({ setPage, previousPage }) => {
         setIsLoading(true);
 
         try {
-            const response = await fetch('http://localhost:8000/api/chat_with_data', {
+            const response = await fetch(`${BACKEND_URL}/api/chat_with_data`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
